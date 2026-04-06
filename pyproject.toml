@@ -11,5 +11,8 @@ requires-python = ">=3.10"
 license = "MIT"
 dependencies = ["mcp>=1.0.0"]
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/classic_mac_hardware"]
+
 [project.scripts]
 classic-mac-hardware-mcp = "classic_mac_hardware.server:main"

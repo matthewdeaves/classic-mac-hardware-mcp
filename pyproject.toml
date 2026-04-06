@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "classic-mac-hardware-mcp"
+version = "1.0.0"
+description = "MCP server for Classic Macintosh hardware — FTP file ops and LaunchAPPL remote execution"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["mcp>=1.0.0"]
+
+[project.scripts]
+classic-mac-hardware-mcp = "classic_mac_hardware.server:main"

@@ -12,7 +12,8 @@
 | Delete files | `delete_files` |
 | Upload file | `upload_file` |
 | Download file | `download_file` |
-| Execute binary | `execute_binary` |
+| Execute binary (single) | `execute_binary` |
+| Execute binary (parallel) | `execute_binary_batch` |
 
 ## Prohibited: Direct FTP/Scripts
 
@@ -37,9 +38,9 @@ Machines are configured in `~/.config/classic-mac-hardware/machines.json` (or ov
 
 ## LaunchAPPL Execution
 
-**Run only ONE test at a time via LaunchAPPL.** Test apps bind to network ports (7353 discovery, 7354 TCP). Running multiple tests causes port conflicts and resource leaks.
+**Run only ONE test at a time per machine via LaunchAPPL.** Test apps bind to network ports (7353 discovery, 7354 TCP). Running multiple tests on the same machine causes port conflicts and resource leaks. Execution is serialized per-machine automatically via async lock.
 
-Execution is serialized automatically via async lock. Default timeout: 120 seconds.
+**To run on multiple machines in parallel, use `execute_binary_batch`** with a list of machine IDs. This executes on all machines simultaneously in a single tool call. Default timeout: 45 seconds per machine.
 
 ## Log Collection
 

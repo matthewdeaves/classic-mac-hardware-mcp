@@ -492,42 +492,32 @@ async def download_file(
     )
 
 
-@mcp.tool()
-async def execute_binary(
-    machine: str, platform: str, binary_path: str
-) -> str:
-    """Run a binary on a Classic Mac via LaunchAPPL. Requires LaunchAPPLServer running on the Mac. Platform: mactcp, opentransport, or appletalk."""
-    s = _get()
-    s.validate_machine_id(machine)
-    m = s.machines[machine]
+LAUNCHAPPL_TIMEOUT = 45  # seconds before killing a LaunchAPPL process
 
-    # Find LaunchAPPL binary
-    launchappl = None
+
+def _find_launchappl() -> str | None:
+    """Find the LaunchAPPL binary on disk."""
     candidates = [
         os.path.expanduser("~/Retro68-build/toolchain/bin/LaunchAPPL"),
         "/opt/Retro68-build/toolchain/bin/LaunchAPPL",
     ]
     for candidate in candidates:
         if os.path.exists(candidate):
-            launchappl = candidate
-            break
+            return candidate
+    return None
 
-    if not launchappl:
-        return (
-            "LaunchAPPL not found. Checked:\n"
-            + "\n".join(f"  - {c}" for c in candidates)
-        )
 
-    if not binary_path or not Path(binary_path).exists():
-        return f"Binary not found: {binary_path}"
-
-    # Get host from launchappl config first, fall back to ftp host
+async def _execute_on_machine(
+    s: ClassicMacHardware, machine: str, binary_path: str, launchappl: str
+) -> str:
+    """Execute a binary on a single machine. Used by both execute_binary and execute_binary_batch."""
+    m = s.machines[machine]
     la_config = m.get('launchappl', {})
     machine_ip = la_config.get('host') or m.get('ftp', {}).get('host')
 
     if not machine_ip:
         return (
-            f"No host configured for {m['name']}. "
+            f"[{m['name']}] No host configured. "
             "Add 'launchappl.host' or 'ftp.host' to machines.json"
         )
 
@@ -550,10 +540,9 @@ async def execute_binary(
                 cwd="/tmp",
             )
 
-            timeout = 120
             try:
                 stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
+                    proc.communicate(), timeout=LAUNCHAPPL_TIMEOUT
                 )
                 stdout_text = stdout.decode() if stdout else ""
                 stderr_text = stderr.decode() if stderr else ""
@@ -561,7 +550,7 @@ async def execute_binary(
                 proc.kill()
                 await proc.wait()
                 return (
-                    f"Timed out after {timeout}s on {m['name']}.\n"
+                    f"[{m['name']}] Timed out after {LAUNCHAPPL_TIMEOUT}s.\n"
                     f"Binary: {binary_name} ({binary_size:,} bytes)\n\n"
                     "The app may still be running. Download logs via FTP:\n"
                     f'  download_file(machine="{machine}", '
@@ -574,7 +563,7 @@ async def execute_binary(
             if proc.returncode == 0:
                 output = stdout_text.strip()
                 return (
-                    f"Executed on {m['name']} (exit 0):\n"
+                    f"[{m['name']}] Executed (exit 0):\n"
                     f"  Binary: {binary_name} ({binary_size:,} bytes)\n"
                     + (
                         f"\n{output}\n"
@@ -584,13 +573,69 @@ async def execute_binary(
                 )
             else:
                 return (
-                    f"FAILED on {m['name']} (exit {proc.returncode}):\n"
+                    f"[{m['name']}] FAILED (exit {proc.returncode}):\n"
                     f"  Binary: {binary_name} ({binary_size:,} bytes)\n\n"
                     f"{stderr_text}\n\n"
                     f"Ensure LaunchAPPLServer is running on {m['name']}"
                 )
         except Exception as e:
-            return f"Error: {e}"
+            return f"[{m['name']}] Error: {e}"
+
+
+@mcp.tool()
+async def execute_binary(
+    machine: str, platform: str, binary_path: str
+) -> str:
+    """Run a binary on a single Classic Mac via LaunchAPPL. For running on multiple machines in parallel, use execute_binary_batch instead."""
+    s = _get()
+    s.validate_machine_id(machine)
+
+    launchappl = _find_launchappl()
+    if not launchappl:
+        return (
+            "LaunchAPPL not found. Checked:\n"
+            "  - ~/Retro68-build/toolchain/bin/LaunchAPPL\n"
+            "  - /opt/Retro68-build/toolchain/bin/LaunchAPPL"
+        )
+
+    if not binary_path or not Path(binary_path).exists():
+        return f"Binary not found: {binary_path}"
+
+    return await _execute_on_machine(s, machine, binary_path, launchappl)
+
+
+@mcp.tool()
+async def execute_binary_batch(
+    machines: list[str], platform: str, binary_path: str
+) -> str:
+    """Run a binary on multiple Classic Macs in parallel via LaunchAPPL. All machines execute simultaneously and results are collected."""
+    s = _get()
+
+    launchappl = _find_launchappl()
+    if not launchappl:
+        return (
+            "LaunchAPPL not found. Checked:\n"
+            "  - ~/Retro68-build/toolchain/bin/LaunchAPPL\n"
+            "  - /opt/Retro68-build/toolchain/bin/LaunchAPPL"
+        )
+
+    if not binary_path or not Path(binary_path).exists():
+        return f"Binary not found: {binary_path}"
+
+    errors = []
+    for mid in machines:
+        try:
+            s.validate_machine_id(mid)
+        except ValueError as e:
+            errors.append(str(e))
+    if errors:
+        return "\n".join(errors)
+
+    results = await asyncio.gather(
+        *[_execute_on_machine(s, mid, binary_path, launchappl) for mid in machines]
+    )
+
+    return "\n\n---\n\n".join(results)
 
 
 # =============================================================================

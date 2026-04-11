@@ -7,9 +7,11 @@ and LaunchAPPL-based remote execution.
 
 Key design decisions for RumpusFTP compatibility:
 - Plain FTP (not SFTP) with passive mode
-- Rate limiting between operations (old Macs are slow)
+- Per-machine rate limiting between operations (old Macs are slow)
 - Mac-style colon paths internally, normalize on input
 - Single operation per connection for stability
+- All tools are async: blocking FTP runs in threads via asyncio.to_thread()
+  so operations on different machines run in parallel
 """
 
 import asyncio
@@ -55,10 +57,16 @@ class ClassicMacHardware:
         self.machines = {}
         self._config_mtime = 0
         self._first_load = True
-        self._last_ftp_time = 0
-        self._exec_lock = asyncio.Lock()
+        self._last_ftp_times: dict[str, float] = {}
+        self._exec_locks: dict[str, asyncio.Lock] = {}
         self._reload_if_changed()
         self._first_load = False
+
+    def _exec_lock_for(self, machine_id: str) -> asyncio.Lock:
+        """Get or create a per-machine execution lock."""
+        if machine_id not in self._exec_locks:
+            self._exec_locks[machine_id] = asyncio.Lock()
+        return self._exec_locks[machine_id]
 
     # =========================================================================
     # Path Normalization
@@ -92,12 +100,13 @@ class ClassicMacHardware:
     # FTP Operations with Rate Limiting
     # =========================================================================
 
-    def rate_limit(self):
-        """Wait if needed to avoid overwhelming RumpusFTP."""
-        elapsed = time.time() - self._last_ftp_time
+    def rate_limit(self, machine_id: str):
+        """Wait if needed to avoid overwhelming RumpusFTP (per-machine)."""
+        last = self._last_ftp_times.get(machine_id, 0)
+        elapsed = time.time() - last
         if elapsed < FTP_OPERATION_DELAY:
             time.sleep(FTP_OPERATION_DELAY - elapsed)
-        self._last_ftp_time = time.time()
+        self._last_ftp_times[machine_id] = time.time()
 
     def connect_ftp(self, machine_id: str) -> FTP:
         """Create FTP connection with rate limiting."""
@@ -108,7 +117,7 @@ class ClassicMacHardware:
                 f"FTP not configured for {machine['name']}. "
                 "This machine uses LaunchAPPL only."
             )
-        self.rate_limit()
+        self.rate_limit(machine_id)
         ftp_config = machine['ftp']
         ftp = FTP()
         ftp.set_pasv(True)
@@ -224,7 +233,7 @@ def _get() -> ClassicMacHardware:
 
 
 @mcp.tool()
-def list_machines() -> str:
+async def list_machines() -> str:
     """List configured Classic Mac machines with their capabilities."""
     s = _get()
     if not s.machines:
@@ -264,65 +273,71 @@ def list_machines() -> str:
 
 
 @mcp.tool()
-def test_connection(machine: str, test_launchappl: bool = False) -> str:
+async def test_connection(machine: str, test_launchappl: bool = False) -> str:
     """Test FTP and/or LaunchAPPL connectivity to a machine."""
     s = _get()
     s.validate_machine_id(machine)
     m = s.machines[machine]
 
-    results = []
+    def _test_blocking():
+        results = []
 
-    # Test FTP only if configured
-    if 'ftp' in m:
-        try:
-            ftp = s.connect_ftp(machine)
-            pwd = ftp.pwd()
-            ftp.quit()
-            results.append(f"FTP: Connected (root: {pwd})")
-        except Exception as e:
-            results.append(f"FTP: FAILED - {str(e)}")
-    else:
-        results.append("FTP: Not configured")
+        # Test FTP only if configured
+        if 'ftp' in m:
+            try:
+                ftp = s.connect_ftp(machine)
+                pwd = ftp.pwd()
+                ftp.quit()
+                results.append(f"FTP: Connected (root: {pwd})")
+            except Exception as e:
+                results.append(f"FTP: FAILED - {str(e)}")
+        else:
+            results.append("FTP: Not configured")
 
-    # Test LaunchAPPL if configured or explicitly requested
-    if 'launchappl' in m or test_launchappl:
-        import socket
-        try:
-            la_config = m.get('launchappl', {})
-            host = la_config.get('host') or m.get('ftp', {}).get('host')
-            port = la_config.get('port', 1984)
+        # Test LaunchAPPL if configured or explicitly requested
+        if 'launchappl' in m or test_launchappl:
+            import socket
+            try:
+                la_config = m.get('launchappl', {})
+                host = la_config.get('host') or m.get('ftp', {}).get('host')
+                port = la_config.get('port', 1984)
 
-            if not host:
-                results.append("LaunchAPPL: No host configured")
-            else:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2)
-                result = sock.connect_ex((host, port))
-                sock.close()
-                if result == 0:
-                    results.append(f"LaunchAPPL: Port {port} open")
+                if not host:
+                    results.append("LaunchAPPL: No host configured")
                 else:
-                    results.append(f"LaunchAPPL: Port {port} not responding")
-        except Exception as e:
-            results.append(f"LaunchAPPL: FAILED - {str(e)}")
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(2)
+                    result = sock.connect_ex((host, port))
+                    sock.close()
+                    if result == 0:
+                        results.append(f"LaunchAPPL: Port {port} open")
+                    else:
+                        results.append(f"LaunchAPPL: Port {port} not responding")
+            except Exception as e:
+                results.append(f"LaunchAPPL: FAILED - {str(e)}")
 
+        return results
+
+    results = await asyncio.to_thread(_test_blocking)
     return f"Connection test: {m['name']}\n\n" + "\n".join(results)
 
 
 @mcp.tool()
-def list_directory(machine: str, path: str = "/") -> str:
+async def list_directory(machine: str, path: str = "/") -> str:
     """List files in a directory on a Classic Mac. Path can use / or : separators."""
     s = _get()
     norm_path = s.normalize_path(path)
 
-    def operation(ftp):
-        if norm_path:
-            ftp.cwd(norm_path)
-        items = []
-        ftp.retrlines('LIST', items.append)
-        return items
+    def _list_blocking():
+        def operation(ftp):
+            if norm_path:
+                ftp.cwd(norm_path)
+            items = []
+            ftp.retrlines('LIST', items.append)
+            return items
+        return s.ftp_operation(machine, operation)
 
-    items = s.ftp_operation(machine, operation)
+    items = await asyncio.to_thread(_list_blocking)
     m = s.machines[machine]
     display_path = norm_path if norm_path else "/"
 
@@ -333,7 +348,7 @@ def list_directory(machine: str, path: str = "/") -> str:
 
 
 @mcp.tool()
-def delete_files(machine: str, path: str, recursive: bool = False) -> str:
+async def delete_files(machine: str, path: str, recursive: bool = False) -> str:
     """Delete a file or directory on a Classic Mac."""
     s = _get()
     norm_path = s.normalize_path(path)
@@ -341,38 +356,42 @@ def delete_files(machine: str, path: str, recursive: bool = False) -> str:
     if not norm_path:
         return "Cannot delete root"
 
-    deleted = []
+    def _delete_blocking():
+        deleted = []
 
-    def delete_recursive(ftp, target):
-        try:
-            ftp.delete(target)
-            deleted.append(target)
-        except Exception:
+        def delete_recursive(ftp, target):
             try:
-                original = ftp.pwd()
-                ftp.cwd(target)
+                ftp.delete(target)
+                deleted.append(target)
+            except Exception:
+                try:
+                    original = ftp.pwd()
+                    ftp.cwd(target)
 
-                if recursive:
-                    items = []
-                    ftp.retrlines('LIST', items.append)
-                    for item in items:
-                        parts = item.split(None, 8)
-                        if len(parts) >= 9:
-                            name = parts[8]
-                            if name not in ['.', '..']:
-                                delete_recursive(ftp, name)
+                    if recursive:
+                        items = []
+                        ftp.retrlines('LIST', items.append)
+                        for item in items:
+                            parts = item.split(None, 8)
+                            if len(parts) >= 9:
+                                name = parts[8]
+                                if name not in ['.', '..']:
+                                    delete_recursive(ftp, name)
 
-                ftp.cwd(original)
-                ftp.rmd(target)
-                deleted.append(f"{target}/")
-            except Exception as e:
-                raise ValueError(f"Cannot delete {target}: {e}")
+                    ftp.cwd(original)
+                    ftp.rmd(target)
+                    deleted.append(f"{target}/")
+                except Exception as e:
+                    raise ValueError(f"Cannot delete {target}: {e}")
 
-    def operation(ftp):
-        delete_recursive(ftp, norm_path)
-        return True
+        def operation(ftp):
+            delete_recursive(ftp, norm_path)
+            return True
 
-    s.ftp_operation(machine, operation)
+        s.ftp_operation(machine, operation)
+        return deleted
+
+    deleted = await asyncio.to_thread(_delete_blocking)
     m = s.machines[machine]
 
     return (
@@ -382,7 +401,7 @@ def delete_files(machine: str, path: str, recursive: bool = False) -> str:
 
 
 @mcp.tool()
-def upload_file(machine: str, local_path: str, remote_path: str) -> str:
+async def upload_file(machine: str, local_path: str, remote_path: str) -> str:
     """Upload a file to a Classic Mac. Creates parent directories if needed."""
     s = _get()
     s.validate_machine_id(machine)
@@ -405,28 +424,31 @@ def upload_file(machine: str, local_path: str, remote_path: str) -> str:
     directory, filename = s.split_path(remote_path)
     file_size = Path(local_path).stat().st_size
 
-    def operation(ftp):
-        if directory:
-            try:
-                ftp.cwd(directory)
-            except Exception:
-                # Create parent directories
-                parts = directory.split(":")
-                current = ""
-                for part in parts:
-                    current = f"{current}:{part}" if current else part
-                    try:
-                        ftp.mkd(current)
-                    except Exception:
-                        pass
-                ftp.cwd(directory)
+    def _upload_blocking():
+        def operation(ftp):
+            if directory:
+                try:
+                    ftp.cwd(directory)
+                except Exception:
+                    # Create parent directories
+                    parts = directory.split(":")
+                    current = ""
+                    for part in parts:
+                        current = f"{current}:{part}" if current else part
+                        try:
+                            ftp.mkd(current)
+                        except Exception:
+                            pass
+                    ftp.cwd(directory)
 
-        with open(local_path, 'rb') as f:
-            ftp.storbinary(f'STOR {filename}', f)
+            with open(local_path, 'rb') as f:
+                ftp.storbinary(f'STOR {filename}', f)
 
-        return True
+            return True
 
-    s.ftp_operation(machine, operation)
+        s.ftp_operation(machine, operation)
+
+    await asyncio.to_thread(_upload_blocking)
 
     return (
         f"Uploaded to {m['name']}:\n\n"
@@ -437,7 +459,7 @@ def upload_file(machine: str, local_path: str, remote_path: str) -> str:
 
 
 @mcp.tool()
-def download_file(
+async def download_file(
     machine: str, remote_path: str, local_path: str = ""
 ) -> str:
     """Download a file from a Classic Mac."""
@@ -449,14 +471,16 @@ def download_file(
         download_dir.mkdir(parents=True, exist_ok=True)
         local_path = str(download_dir / filename)
 
-    def operation(ftp):
-        if directory:
-            ftp.cwd(directory)
-        with open(local_path, 'wb') as f:
-            ftp.retrbinary(f'RETR {filename}', f.write)
-        return True
+    def _download_blocking():
+        def operation(ftp):
+            if directory:
+                ftp.cwd(directory)
+            with open(local_path, 'wb') as f:
+                ftp.retrbinary(f'RETR {filename}', f.write)
+            return True
+        s.ftp_operation(machine, operation)
 
-    s.ftp_operation(machine, operation)
+    await asyncio.to_thread(_download_blocking)
     m = s.machines[machine]
     file_size = Path(local_path).stat().st_size
 
@@ -511,9 +535,9 @@ async def execute_binary(
     binary_size = Path(binary_path_resolved).stat().st_size
     binary_name = Path(binary_path_resolved).name
 
-    # Serialize all LaunchAPPL calls -- one at a time to avoid
-    # network contention and port conflicts on the Mac side.
-    async with s._exec_lock:
+    # Serialize LaunchAPPL calls per-machine to avoid port conflicts
+    # on the Mac side, while allowing different machines to run in parallel.
+    async with s._exec_lock_for(machine):
         try:
             cmd = [
                 launchappl, "-e", "tcp", "--tcp-address", machine_ip,

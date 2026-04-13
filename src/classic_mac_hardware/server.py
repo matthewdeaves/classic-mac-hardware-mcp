@@ -255,14 +255,16 @@ async def list_machines() -> str:
             features.append('LaunchAPPL')
         features_str = '+'.join(features) if features else 'no remote'
 
+        cpu = m.get('cpu', '')
+        platform = m.get('platform', '')
         build_type = m.get('build', 'standard')
         ram = m.get('ram', '')
+        system = m.get('system', '')
         build_info = f" [{build_type}]" if build_type == 'lowmem' else ""
-        ram_info = f" ({ram})" if ram else ""
 
         lines.append(
-            f"  {mid}: {m['name']} ({m['platform']}) - "
-            f"{host} [{features_str}]{ram_info}{build_info}"
+            f"  {mid}: {m['name']} — {cpu}, {platform}, {system}, "
+            f"{ram}, {host} [{features_str}]{build_info}"
         )
 
     if any(m.get('build') == 'lowmem' for m in s.machines.values()):
@@ -586,7 +588,24 @@ async def _execute_on_machine(
 async def execute_binary(
     machine: str, platform: str, binary_path: str
 ) -> str:
-    """Run a binary on a single Classic Mac via LaunchAPPL. For running on multiple machines in parallel, use execute_binary_batch instead."""
+    """Run a binary on a single Classic Mac via LaunchAPPL.
+
+    LaunchAPPL transfers the binary over the network and executes it — no
+    separate upload step is needed.
+
+    Args:
+        machine: Machine ID from machines.json (e.g. "performa6400").
+        platform: Target platform hint (e.g. "ppc", "68k"). Used to
+            validate the binary matches the machine's CPU architecture.
+        binary_path: LOCAL filesystem path to a MacBinary (.bin) file
+            produced by the Retro68 build (e.g.
+            "/home/user/project/build-ppc-ot/App.bin"). This is NOT a
+            path on the remote Mac.
+
+    For running on multiple machines in parallel with the SAME binary,
+    use execute_binary_batch.  For different binaries per machine (e.g.
+    PPC vs 68k builds), call execute_binary once per machine.
+    """
     s = _get()
     s.validate_machine_id(machine)
 
@@ -601,6 +620,26 @@ async def execute_binary(
     if not binary_path or not Path(binary_path).exists():
         return f"Binary not found: {binary_path}"
 
+    # Warn if platform doesn't match the machine's CPU
+    m = s.machines[machine]
+    cpu = m.get('cpu', '').lower()
+    plat = platform.lower() if platform else ''
+    if plat and cpu:
+        is_68k_machine = '68' in cpu
+        is_68k_binary = '68' in plat or 'm68k' in plat
+        is_ppc_machine = 'ppc' in cpu or 'powerpc' in cpu or '603' in cpu or '604' in cpu
+        is_ppc_binary = 'ppc' in plat or 'powerpc' in plat
+        if is_68k_machine and is_ppc_binary:
+            return (
+                f"Platform mismatch: {m['name']} has a {m.get('cpu', '?')} CPU "
+                f"but binary platform is '{platform}'. Use a 68k build."
+            )
+        if is_ppc_machine and is_68k_binary:
+            return (
+                f"Platform mismatch: {m['name']} has a {m.get('cpu', '?')} CPU "
+                f"but binary platform is '{platform}'. Use a PPC build."
+            )
+
     return await _execute_on_machine(s, machine, binary_path, launchappl)
 
 
@@ -608,7 +647,15 @@ async def execute_binary(
 async def execute_binary_batch(
     machines: list[str], platform: str, binary_path: str
 ) -> str:
-    """Run a binary on multiple Classic Macs in parallel via LaunchAPPL. All machines execute simultaneously and results are collected."""
+    """Run the SAME binary on multiple Classic Macs in parallel via LaunchAPPL.
+
+    All machines execute simultaneously and results are collected.  The
+    binary_path is a LOCAL filesystem path to a MacBinary (.bin) file — the
+    same file is sent to every machine.
+
+    Only use this when all target machines share the same CPU architecture
+    (e.g. all PPC).  For mixed architectures (PPC + 68k), call
+    execute_binary individually for each machine with the correct build."""
     s = _get()
 
     launchappl = _find_launchappl()
